@@ -39,7 +39,7 @@ class Stack(Generic[T]):
         return self.__top
 
     def save(self) -> StackSnapshot[T | None]:
-        active_data = list(self.__data[:self.__top])
+        active_data: list[T | None] = list(self.__data[:self.__top])
         return StackSnapshot(
             data=active_data,
             top=self.__top,
