@@ -7,8 +7,8 @@ def main() -> int:
     print("--- Initializing Epilogue Engine ---")
 
     # 1. Set up our tracked infrastructure
-    monitor = StackMonitor()
-    stack = Stack[str](cap=3)
+    monitor: StackMonitor[str] = StackMonitor[str]()
+    stack: Stack[str] = Stack[str](cap=3)
 
     # Log initial creation state
     monitor.log("INIT", None, stack.save())

@@ -1,15 +1,28 @@
 from __future__ import annotations
 
+from typing import Generic, TypeVar
+
 from .snapshot import StackSnapshot
 from .trace    import StackTrace
 
-class StackMonitor:
+T = TypeVar('T')
+
+class StackMonitor(Generic[T]):
 
     def __init__(self) -> None:
-        self.__trace: StackTrace[str] = StackTrace[str]()
+        self.__trace: StackTrace[T] = StackTrace[T]()
 
-    def log(self, operation: str, argument: str | None, snapshot: StackSnapshot[str | None]) -> None:
-        self.__trace.log(operation, argument, snapshot)
+    def log(
+        self,
+        operation: str,
+        argument: T | None,
+        snapshot: StackSnapshot[T | None],
+    ) -> None:
+        self.__trace.log(
+            operation,
+            argument,
+            snapshot,
+        )
 
     def dump(self) -> str:
         return self.__trace.dump()
