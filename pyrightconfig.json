@@ -1,0 +1,18 @@
+{
+  "venvPath": ".",
+  "venv": "env",
+  "stubPath": "v12/typing/stubs",
+  "include": [
+    "v12",
+    "tests",
+  ],
+  "executionEnvironments": [
+  ],
+  "exclude": [
+    "**/.*",
+    "**/.*/",
+    "**/.git",
+    "**/__pycache__",
+    "env"
+  ]
+}
