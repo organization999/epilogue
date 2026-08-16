@@ -1,12 +1,12 @@
 """Batch-oriented persistence for generic Epilogue observations.
 
 This module contains :class:`BatchMonitor`, the generic persistence primitive
-used by Epilogue integrations.  A monitor accepts ordinary Python values,
+used by Epilogue integrations. A monitor accepts ordinary Python values,
 attaches execution metadata, buffers records in memory, and writes complete
 batches as newline-delimited JSON (NDJSON).
 
-Epilogue intentionally does not define an observation schema.  The embedding
-application owns the payload type and semantic meaning.  Consequently this
+Epilogue intentionally does not define an observation schema. The embedding
+application owns the payload type and semantic meaning. Consequently this
 module can record UNI expression data, scheduler events, service telemetry, or
 any other JSON-serializable Python value without importing those applications.
 """
@@ -18,140 +18,149 @@ import threading
 import time
 
 from pathlib import Path
-from typing  import Generic, Iterable, TypeVar
+from typing import Callable, Generic, Iterable, TypeVar
+
+from .cpu import SystemCPUUtilization
 
 T = TypeVar('T')
+CPUUtilizationSampler = Callable[[], float | None]
 
 
 class BatchMonitor(Generic[T]):
-    """Collect generic Python observations and persist them in batches.
+    """Collect generic observations and persist them with sparse disk writes.
 
-    ``BatchMonitor`` is the batch-only storage boundary for Epilogue.  Each call
-    to :meth:`log` creates a record containing a monotonically increasing
-    process-local sequence number, a nanosecond wall-clock timestamp, an
-    application-defined operation name, and the opaque application observation.
+    Routine persistence has two triggers only:
 
-    Records are retained in memory until ``batch_size`` records are pending or
-    the caller explicitly invokes :meth:`flush` or :meth:`close`.  Persistence
-    is append-only NDJSON: one complete JSON object is written per line.
+    * the in-memory batch reaches ``batch_size``; or
+    * :meth:`flush_if_cpu_low` observes host CPU utilization at or below
+      ``low_cpu_threshold``.
 
-    The observation type parameter ``T`` exists only for static typing.
-    Epilogue does not inspect, transform, or otherwise interpret values of that
-    type.  Values must only be serializable by :func:`json.dumps`.
+    This keeps normal logging off the disk while the application is busy. A
+    host integration may call :meth:`flush_if_cpu_low` frequently; Epilogue
+    internally rate-limits CPU samples with ``cpu_check_interval`` and therefore
+    does not turn a fast application polling loop into a fast disk-write loop.
+
+    Explicit :meth:`flush` and :meth:`close` remain durability overrides for
+    operator requests and process teardown. They are not part of the routine
+    automatic flush policy.
 
     Args:
-        path: Destination for the append-only NDJSON ledger.  Parent directories
+        path: Destination for the append-only NDJSON ledger. Parent directories
             are created lazily during the first flush.
-        batch_size: Maximum number of in-memory records before an automatic
-            flush.  Must be greater than zero.
+        batch_size: Number of pending records that triggers an automatic flush.
+            Must be greater than zero.
+        low_cpu_threshold: Maximum host CPU utilization that permits an
+            opportunistic partial-batch flush. ``20.0`` means a partial batch
+            may be persisted when sampled utilization is at or below 20 percent.
+        cpu_check_interval: Minimum seconds between host CPU samples used for
+            opportunistic flushing. The default of five seconds bounds low-CPU
+            disk opportunities even when the host calls
+            :meth:`flush_if_cpu_low` much more frequently.
+        cpu_sampler: Optional application/test supplied utilization callback.
+            It must return a percentage in ``0.0..100.0`` or ``None`` when no
+            sample is currently available. When omitted,
+            :class:`SystemCPUUtilization` is used.
 
     Raises:
-        ValueError: If ``batch_size`` is zero or negative.
+        ValueError: If ``batch_size`` or ``cpu_check_interval`` is not positive,
+            or if ``low_cpu_threshold`` falls outside ``0.0..100.0``.
 
     Notes:
         Public mutation and inspection methods are synchronized with an internal
-        :class:`threading.Lock`.  A monitor may therefore be shared by multiple
-        Python threads.  The lock protects monitor state; it does not provide
-        inter-process locking for multiple processes writing the same file.
+        :class:`threading.Lock`. One monitor can therefore be shared by multiple
+        Python threads. The lock is process-local and does not provide
+        inter-process file locking.
 
-        Timestamps are captured with :func:`time.time_ns`, so ``timestamp_ns``
-        represents wall-clock nanoseconds since the Unix epoch.  ``sequence`` is
-        independent of wall-clock time and is monotonically increasing only for
-        the lifetime of this monitor instance.
+        Low-CPU persistence is deliberately *cooperative*. Epilogue owns the
+        policy and CPU decision, while the embedding runtime supplies convenient
+        scheduling points by calling :meth:`flush_if_cpu_low`. This avoids a
+        permanent background thread inside every monitor instance.
 
-        Destructor-based durability is intentionally avoided.  Use
-        :meth:`close`, :meth:`flush`, or the context-manager protocol when
-        pending records must be persisted deterministically.
-
-    Example:
-        >>> from epilogue import BatchMonitor
-        >>> monitor = BatchMonitor[dict[str, object]](
-        ...     'tmp/epilogue/events.ndjson',
-        ...     batch_size=2,
-        ... )
-        >>> monitor.log('expression.execute', {'version': 2})
-        >>> monitor.pending()
-        1
-        >>> monitor.close()
+        Timestamps use :func:`time.time_ns`. CPU-check scheduling uses
+        :func:`time.monotonic_ns`, so wall-clock adjustments cannot cause a
+        burst of utilization checks.
     """
 
     def __init__(
         self,
         path: str | Path,
         batch_size: int = 256,
+        low_cpu_threshold: float = 20.0,
+        cpu_check_interval: float = 5.0,
+        cpu_sampler: CPUUtilizationSampler | None = None,
     ) -> None:
-        """Initialize an append-only batch monitor.
+        """Initialize a sparse-write batch monitor.
 
-        Args:
-            path: File path receiving persisted NDJSON records.
-            batch_size: Number of pending records that triggers an automatic
-                flush.
-
-        Raises:
-            ValueError: If ``batch_size`` is less than or equal to zero.
-
-        Notes:
-            Construction does not touch the filesystem.  The destination parent
-            directory and file are created only when a non-empty batch is
-            flushed.
+        Construction does not touch the filesystem. The destination is created
+        only after the batch fills, CPU utilization is sampled low enough, or an
+        explicit durability method is invoked.
         """
         if batch_size <= 0:
             raise ValueError('batch_size must be greater than zero')
 
+        if not (0.0 <= low_cpu_threshold <= 100.0):
+            raise ValueError(
+                'low_cpu_threshold must be between 0 and 100'
+            )
+
+        if cpu_check_interval <= 0.0:
+            raise ValueError('cpu_check_interval must be greater than zero')
+
+        system_cpu = SystemCPUUtilization()
+
         self.__path: Path = Path(path)
         self.__batch_size: int = batch_size
+        self.__low_cpu_threshold: float = float(low_cpu_threshold)
+        self.__cpu_check_interval_ns: int = max(
+            1,
+            int(cpu_check_interval * 1_000_000_000.0),
+        )
+        self.__cpu_sampler: CPUUtilizationSampler = (
+            cpu_sampler
+            if cpu_sampler is not None
+            else system_cpu.sample
+        )
         self.__entries: list[dict[str, object]] = []
         self.__sequence: int = 0
+        self.__next_cpu_check_ns: int = 0
         self.__lock: threading.Lock = threading.Lock()
 
     @property
     def path(self) -> Path:
-        """Return the configured append-only ledger destination.
-
-        Returns:
-            The :class:`pathlib.Path` supplied when the monitor was constructed.
-
-        Notes:
-            The path may not exist yet because Epilogue creates it lazily during
-            the first non-empty flush.
-        """
+        """Return the configured append-only ledger destination."""
         return self.__path
 
     @property
     def batch_size(self) -> int:
-        """Return the automatic-flush threshold.
-
-        Returns:
-            The positive number of pending records required to trigger an
-            automatic flush.
-        """
+        """Return the full-batch automatic flush threshold."""
         return self.__batch_size
 
-    def log(self, operation: str, observation: T) -> None:
-        """Record one observation.
+    @property
+    def low_cpu_threshold(self) -> float:
+        """Return the utilization percentage permitting opportunistic flushes."""
+        return self.__low_cpu_threshold
 
-        The observation is wrapped with Epilogue metadata and appended to the
-        current in-memory batch.  If the append reaches ``batch_size``, the
-        complete batch is persisted before this method returns.
+    @property
+    def cpu_check_interval(self) -> float:
+        """Return the minimum seconds between opportunistic CPU samples."""
+        return (
+            float(self.__cpu_check_interval_ns)
+            / 1_000_000_000.0
+        )
+
+    def log(self, operation: str, observation: T) -> None:
+        """Buffer one observation and persist only when the batch becomes full.
 
         Args:
-            operation: Application-defined name describing what was observed.
-                The value is stored verbatim in the ledger and must not be empty.
-            observation: Opaque application payload.  Epilogue does not inspect
-                its schema, but it must be JSON-serializable when the batch is
-                flushed.
-
-        Raises:
-            ValueError: If ``operation`` is empty, or if automatic flushing
-                encounters a non-finite float while JSON encoding.
-            TypeError: If automatic flushing encounters a value unsupported by
-                Python's JSON encoder.
-            OSError: If automatic flushing cannot create or append to the ledger.
+            operation: Non-empty application-defined operation name.
+            observation: Opaque JSON-serializable application payload.
 
         Notes:
-            Sequence numbers are assigned while holding the monitor lock, so the
-            order recorded by one monitor is deterministic with respect to
-            successful calls entering the critical section.
+            ``log`` intentionally does not perform a CPU utilization sample.
+            CPU-aware partial persistence is separated into
+            :meth:`flush_if_cpu_low`, allowing a runtime to place checks in its
+            existing idle/maintenance loop without putting system calls on every
+            logging operation.
         """
         if not operation:
             raise ValueError('operation must not be empty')
@@ -170,105 +179,101 @@ class BatchMonitor(Generic[T]):
                 self.__flush_locked()
 
     def log_batch(self, operation: str, observations: Iterable[T]) -> None:
-        """Record an iterable of observations using one operation name.
-
-        Args:
-            operation: Application-defined operation stored on every generated
-                record.
-            observations: Iterable of opaque application payloads.
-
-        Raises:
-            ValueError: If ``operation`` is empty, or if a flush encounters a
-                non-finite float.
-            TypeError: If a flush encounters a non-JSON-serializable value.
-            OSError: If a flush cannot create or append to the ledger.
-
-        Notes:
-            This method delegates each element to :meth:`log`.  Therefore normal
-            batch thresholds still apply while the iterable is consumed; a large
-            iterable can produce multiple persisted batches.
-        """
+        """Buffer an iterable of observations using one operation name."""
         for observation in observations:
             self.log(operation, observation)
 
     def pending(self) -> int:
-        """Return the number of records still buffered in memory.
-
-        Returns:
-            Count of records that have not yet been persisted by this monitor.
-        """
+        """Return the number of records still buffered in memory."""
         with self.__lock:
             return len(self.__entries)
 
-    def flush(self) -> None:
-        """Persist all pending records.
+    def flush_if_cpu_low(
+        self,
+        *,
+        force_check: bool = False,
+    ) -> bool:
+        """Persist a partial batch only when sampled host CPU utilization is low.
 
-        Pending entries are JSON-encoded and appended to the configured ledger
-        as one NDJSON line per record.  An empty flush is a no-op.
+        Args:
+            force_check: Ignore the normal CPU sampling interval for this call.
+                This forces a *CPU sample*, not a disk write. The batch is still
+                persisted only if utilization is at or below
+                ``low_cpu_threshold``.
 
-        Raises:
-            ValueError: If an observation contains a non-finite float.  Epilogue
-                uses ``allow_nan=False`` so persisted data remains strict JSON.
-            TypeError: If a record contains a value unsupported by the standard
-                JSON encoder.
-            OSError: If the destination directory cannot be created or the
-                ledger cannot be opened or written.
+        Returns:
+            ``True`` when pending data was written to disk. ``False`` when the
+            batch was empty, the CPU check was rate-limited, no utilization
+            sample was available, or sampled utilization was above the threshold.
 
         Notes:
-            Entries are cleared only after the append completes successfully.
-            If encoding or I/O fails, the pending batch remains available for a
-            later retry.
+            CPU sampling is performed outside the monitor lock. The disk flush,
+            when allowed, re-enters the lock and persists whatever entries are
+            pending at that moment.
+        """
+        now: int = time.monotonic_ns()
+
+        with self.__lock:
+            if not self.__entries:
+                return False
+
+            if (
+                (not force_check)
+                and (now < self.__next_cpu_check_ns)
+            ):
+                return False
+
+            self.__next_cpu_check_ns = (
+                now
+                + self.__cpu_check_interval_ns
+            )
+
+        utilization: float | None = self.__cpu_sampler()
+
+        if utilization is None:
+            return False
+
+        utilization = min(
+            100.0,
+            max(
+                0.0,
+                float(utilization),
+            ),
+        )
+
+        if utilization > self.__low_cpu_threshold:
+            return False
+
+        with self.__lock:
+            if not self.__entries:
+                return False
+
+            self.__flush_locked()
+            return True
+
+    def flush(self) -> None:
+        """Force persistence of all pending records.
+
+        This method is an explicit durability override. Routine integrations
+        should prefer full-batch flushing plus :meth:`flush_if_cpu_low`.
         """
         with self.__lock:
             self.__flush_locked()
 
     def close(self) -> None:
-        """Flush pending observations as the monitor's durability boundary.
-
-        Raises:
-            ValueError: If pending data cannot be represented as strict JSON.
-            TypeError: If pending data is not JSON-serializable.
-            OSError: If pending data cannot be persisted.
-
-        Notes:
-            ``close()`` currently does not permanently disable the monitor; it
-            is an explicit durability operation equivalent to :meth:`flush`.
-        """
+        """Force persistence of pending observations during monitor teardown."""
         self.flush()
 
     def __enter__(self) -> BatchMonitor[T]:
-        """Enter a context-manager scope.
-
-        Returns:
-            This monitor instance.
-        """
+        """Enter a context-manager scope and return this monitor."""
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:  # type: ignore[no-untyped-def]
-        """Flush pending observations when leaving a context-manager scope.
-
-        Args:
-            exc_type: Exception type active at scope exit, if any.
-            exc_value: Exception instance active at scope exit, if any.
-            traceback: Traceback active at scope exit, if any.
-
-        Notes:
-            Exceptions raised inside the managed block are not suppressed.
-            ``close()`` is still attempted while the scope exits.
-        """
+        """Force pending data to disk when leaving a context-manager scope."""
         self.close()
 
     def __flush_locked(self) -> None:
-        """Encode and append the current batch while ``__lock`` is held.
-
-        This helper centralizes the durable write path for both automatic and
-        explicit flushing.  Callers must already own ``__lock``.
-
-        Raises:
-            ValueError: If strict JSON encoding rejects a non-finite float.
-            TypeError: If JSON encoding encounters an unsupported value.
-            OSError: If directory creation or file I/O fails.
-        """
+        """Encode and append the current batch while ``__lock`` is held."""
         if not self.__entries:
             return
 
