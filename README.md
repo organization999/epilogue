@@ -33,6 +33,30 @@ monitor.flush()
 The application owns the meaning and shape of `expression`. Epilogue treats it
 as opaque Python data.
 
+## Examples
+
+A complete generic expression-data example is available at
+`examples/expression_observability.py`. It deliberately does **not** import UNI;
+it defines an application-owned `TypedDict`, records several observations, shows
+automatic batch flushing, then reads the generated NDJSON back.
+
+Run it from the repository root:
+
+```text
+python examples/expression_observability.py
+```
+
+The original stack tracing/recovery demonstration remains available with:
+
+```text
+python -m epilogue
+```
+
+These examples demonstrate the two separate Epilogue surfaces:
+
+- `BatchMonitor[T]` is the generic batch persistence API used by integrations.
+- `StackMonitor[T]` is an in-memory trace facade for stack state diagnostics.
+
 ## Batch behavior
 
 Records remain in memory until the configured batch size is reached or `flush()`
@@ -46,6 +70,34 @@ Records remain in memory until the configured batch size is reached or `flush()`
 The ledger is append-only NDJSON so post-processing can stream records without
 loading the complete run into memory.
 
+`BatchMonitor` uses strict JSON encoding (`allow_nan=False`). Invalid JSON values,
+unsupported object types, and filesystem errors are surfaced to the caller
+rather than being silently discarded. Pending records are cleared only after a
+successful append.
+
+## Threading and lifecycle
+
+A `BatchMonitor` protects its in-process buffer, sequence number, and flush path
+with a Python lock, so multiple Python threads may share one monitor. This is
+thread synchronization, not inter-process file locking; separate processes
+should not assume coordinated writes to the same ledger.
+
+Use `flush()`, `close()`, or the context-manager protocol as the explicit
+durability boundary:
+
+```python
+with BatchMonitor[dict[str, object]](
+    'path/to/ledger.ndjson',
+) as monitor:
+    monitor.log(
+        'example.execute',
+        {'value': 42},
+    )
+```
+
+The context manager flushes pending records when its scope exits and does not
+suppress exceptions from the managed block.
+
 ## Storage ownership
 
 Epilogue accepts a destination path from the embedding application. It uses
@@ -58,3 +110,15 @@ its LFS `/var/log/epilogue` hierarchy without adding LFS knowledge to Epilogue.
 Epilogue has no native C++ API and no pybind11 dependency. Native applications
 that want to use Epilogue should expose their observation data at the Python
 boundary and let Python own batching and persistence.
+
+## API documentation
+
+The Python sources use pydoc-compatible docstrings throughout the public API.
+You can inspect them directly from a Python environment:
+
+```text
+python -m pydoc epilogue
+python -m pydoc epilogue.batch
+python -m pydoc epilogue.monitor
+python -m pydoc epilogue.trace
+```
