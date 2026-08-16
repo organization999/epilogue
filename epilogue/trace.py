@@ -22,10 +22,12 @@ class StackTrace(Generic[T]):
         ))
 
     def dump(self) -> str:
-        lines = ["=== EPILOGUE STACK TRACE LEDGER ==="]
+        lines: list[str] = ['=== EPILOGUE STACK TRACE LEDGER ===']
+
         for idx, entry in enumerate(self.entries):
-            ts = entry.timestamp.strftime("%H:%M:%S.%f")[:-3]
-            arg_str = f" ({entry.argument})" if entry.argument is not None else ""
-            lines.append(f"[{ts}] Step {idx}: {entry.operation}{arg_str}")
-            lines.append(f"  └─ State: {entry.snapshot.data} (Size: {entry.snapshot.top}/{entry.snapshot.cap})")
-        return "\n".join(lines)
+            ts: str = entry.timestamp.strftime('%H:%M:%S.%f')[:-3]
+            arg_str: str = f' ({entry.argument})' if entry.argument is not None else ''
+            lines.append(f'[{ts}] Step {idx}: {entry.operation}{arg_str}')
+            lines.append(f'  └─ State: {entry.snapshot.data} (Size: {entry.snapshot.top}/{entry.snapshot.cap})')
+
+        return '\n'.join(lines)
