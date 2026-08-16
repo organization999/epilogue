@@ -1,9 +1,27 @@
+"""Command-line demonstration for the Epilogue stack trace API.
+
+Run ``python -m epilogue`` to execute a fixed-capacity stack scenario that
+records normal operations, captures a checkpoint, simulates an overflow, and
+restores the previous stable snapshot.
+"""
+
 from __future__ import annotations
 
 from .collections.stack import Stack
 from .monitor           import StackMonitor
 
+
 def main() -> int:
+    """Run the stack tracing and recovery demonstration.
+
+    Returns:
+        Process exit status.  ``0`` indicates the demonstration completed
+        normally.
+
+    Notes:
+        This example exercises :class:`StackMonitor`.  The generic batch
+        persistence example lives in ``examples/expression_observability.py``.
+    """
     print("--- Initializing Epilogue Engine ---")
 
     # 1. Set up our tracked infrastructure
@@ -49,6 +67,7 @@ def main() -> int:
 
     print(f"\nFinal active stack state: {stack.save().data}")
     return 0
+
 
 if __name__ == '__main__':
     raise SystemExit(main())
