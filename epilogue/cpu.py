@@ -12,8 +12,6 @@ import ctypes
 import os
 import threading
 
-from pathlib import Path
-
 
 class SystemCPUUtilization:
     """Sample approximate host CPU utilization as a percentage.
@@ -22,7 +20,9 @@ class SystemCPUUtilization:
     samples can be converted into utilization over an interval.
 
     * Windows uses ``GetSystemTimes`` through :mod:`ctypes`.
-    * Linux reads the aggregate counters from ``/proc/stat``.
+    * Linux reads the aggregate counters from ``/proc/stat`` with low-level
+      :mod:`os` file descriptors so host metrics are not routed through an
+      application's monkey-patched Python filesystem layer.
     * Other platforms fall back to a one-minute load average normalized by the
       number of logical CPUs when :func:`os.getloadavg` is available.
 
@@ -96,18 +96,30 @@ class SystemCPUUtilization:
 
     def __sample_linux(self) -> float | None:
         """Sample Linux aggregate counters from ``/proc/stat`` when present."""
-        stat: Path = Path('/proc/stat')
-
-        if not stat.exists():
-            return None
+        descriptor: int | None = None
 
         try:
-            line: str = stat.read_text(
-                encoding='utf-8',
+            descriptor = os.open(
+                '/proc/stat',
+                os.O_RDONLY,
+            )
+
+            data: bytes = os.read(
+                descriptor,
+                4096,
+            )
+
+            line: str = data.decode(
+                'ascii',
                 errors='strict',
             ).splitlines()[0]
         except (OSError, IndexError, UnicodeError):
             return None
+        finally:
+            if descriptor is not None:
+                os.close(
+                    descriptor
+                )
 
         fields: list[str] = line.split()
 
