@@ -6,11 +6,8 @@ include setup.py
 recursive-include buildsystem *.py
 recursive-include docs *.md
 recursive-include examples *.py
-recursive-include include *.hpp *.inl
-recursive-include source *.cc
-recursive-include tests *.cc *.hpp *.py
+recursive-include tests *.py
 recursive-include epilogue *.py *.pyi py.typed
-recursive-include vendor/epilogue/include *.hpp *.inl
 
 global-exclude *.py[cod]
 global-exclude __pycache__
