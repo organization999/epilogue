@@ -1,9 +1,9 @@
 {
   "venvPath": ".",
   "venv": "env",
-  "stubPath": "v12/typing/stubs",
+  "stubPath": "epilogue/typing/stubs",
   "include": [
-    "v12",
+    "epilogue",
     "tests",
   ],
   "executionEnvironments": [
